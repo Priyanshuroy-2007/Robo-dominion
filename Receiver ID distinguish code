@@ -1,0 +1,107 @@
+/*
+ * LIFI RECEIVER (ESP32)
+ * Pins: 34, 35
+ * Uses parallel Goertzel Filters to detect ID1 (1000Hz) and ID2 (2000Hz).
+ */
+
+#define PIN_34 34
+#define PIN_35 35
+
+// We increased the sampling frequency to 6000Hz to accurately capture the 2000Hz signal
+#define SAMPLING_FREQ 6000.0  
+#define SAMPLES 120           // 20ms sampling window
+
+// The targeted frequencies
+const float TARGET_FREQS[2] = {1500.0, 2000.0};
+float coeff[2];
+
+// *** CALIBRATION NEEDED ***
+// 2000Hz will naturally have a lower magnitude than 1000Hz due to solar panel physics.
+// Tune these independently using the Serial monitor!
+const float THRESHOLD_ID1 = 500000.0; 
+const float THRESHOLD_ID2 = 300000.0; // Likely needs to be lower than ID1
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Calculate Goertzel coefficients for both frequencies
+  for(int f = 0; f < 2; f++) {
+    int k = (int)(0.5 + (SAMPLES * TARGET_FREQS[f]) / SAMPLING_FREQ);
+    float w = (2.0 * PI * k) / SAMPLES;
+    coeff[f] = 2.0 * cos(w);
+  }
+  
+  Serial.println("Receiver Ready. Scanning for ID1 and ID2...");
+}
+
+void loop() {
+  // 2D Arrays to hold previous states: [Frequency Index][Panel Index]
+  float s_prev[2][2] = {{0.0, 0.0}, {0.0, 0.0}}; 
+  float s_prev2[2][2] = {{0.0, 0.0}, {0.0, 0.0}};
+  
+  unsigned long sampling_period_us = 1000000 / SAMPLING_FREQ; 
+
+  // --- SAMPLING PHASE ---
+  for (int i = 0; i < SAMPLES; i++) {
+    unsigned long start_time = micros();
+    
+    // Read both panels
+    float adc[2] = {(float)analogRead(PIN_34), (float)analogRead(PIN_35)};
+
+    // Apply Goertzel math for both frequencies across both panels
+    for(int f = 0; f < 2; f++) {        // Loop through frequencies
+      for(int p = 0; p < 2; p++) {      // Loop through panels
+        float s = adc[p] + coeff[f] * s_prev[f][p] - s_prev2[f][p];
+        s_prev2[f][p] = s_prev[f][p];
+        s_prev[f][p] = s;
+      }
+    }
+    
+    // Wait for exact microsecond timing
+    while (micros() - start_time < sampling_period_us);
+  }
+  
+  // --- ANALYSIS PHASE ---
+  bool id1_detected = false;
+  bool id2_detected = false;
+  
+  // Variables to hold magnitudes for calibration printing
+  float mag_id1_p1 = 0, mag_id1_p2 = 0;
+  float mag_id2_p1 = 0, mag_id2_p2 = 0;
+
+  for(int f = 0; f < 2; f++) {
+    for(int p = 0; p < 2; p++) {
+      // Calculate signal power
+      float magnitude = s_prev2[f][p] * s_prev2[f][p] + 
+                        s_prev[f][p] * s_prev[f][p] - 
+                        coeff[f] * s_prev[f][p] * s_prev2[f][p];
+      
+      // Store magnitudes for printing
+      if (f == 0 && p == 0) mag_id1_p1 = magnitude;
+      if (f == 0 && p == 1) mag_id1_p2 = magnitude;
+      if (f == 1 && p == 0) mag_id2_p1 = magnitude;
+      if (f == 1 && p == 1) mag_id2_p2 = magnitude;
+
+      // Check against independent thresholds
+      if (f == 0 && magnitude > THRESHOLD_ID1) id1_detected = true;
+      if (f == 1 && magnitude > THRESHOLD_ID2) id2_detected = true;
+    }
+  }
+
+  // UNCOMMENT BELOW TO CALIBRATE NEW THRESHOLDS:
+  /*
+  Serial.printf("ID1(1kHz) Mag - P1: %.0f | P2: %.0f \t", mag_id1_p1, mag_id1_p2);
+  Serial.printf("ID2(2kHz) Mag - P1: %.0f | P2: %.0f \n", mag_id2_p1, mag_id2_p2);
+  */
+
+  // --- LOGIC OUTPUT ---
+  if (id1_detected && id2_detected) {
+    Serial.println(" ID1 & ID2 detected "); // Optional safety chVBeck
+  } else if (id1_detected) {
+    Serial.println("ID1");
+  } else if (id2_detected) {
+    Serial.println("ID2");
+  } else {
+    Serial.println("Laser not Detected");
+  }
+}
