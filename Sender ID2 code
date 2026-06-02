@@ -1,0 +1,25 @@
+/*
+ * LIFI SENDER 2 (ID2)
+ * Pin: 25
+ * Emits a continuous 2 kHz signal.
+ */
+
+#define LASER_PIN 25
+#define FREQUENCY 2000    // 2 kHz for ID2
+#define RESOLUTION 8      
+
+void setup() {
+  Serial.begin(115200);
+  
+  bool success = ledcAttach(LASER_PIN, FREQUENCY, RESOLUTION);
+  if (!success) Serial.println("Error: Failed to setup PWM.");
+  
+  // Set duty cycle to 50%
+  ledcWrite(LASER_PIN, 127); 
+  
+  Serial.println("Sender 2 Active: ID2 at 2000 Hz");
+}
+
+void loop() {
+  // Hardware timer handles the transmission
+}
