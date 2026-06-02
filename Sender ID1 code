@@ -1,0 +1,30 @@
+/*
+ * LIFI SENDER 1 (ID1)
+ * Pin: 25
+ * Emits a continuous 1500 Hz signal to avoid ambient light interference.
+ */
+
+#define LASER_PIN 25
+#define FREQUENCY 1500    // Changed to 1500 Hz for better accuracy
+#define RESOLUTION 8      
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize hardware PWM on Pin 25
+  bool success = ledcAttach(LASER_PIN, FREQUENCY, RESOLUTION);
+  
+  if (!success) {
+    Serial.println("Error: Failed to setup PWM.");
+    return;
+  }
+  
+  // Set duty cycle to 50% for a clean, readable pulse
+  ledcWrite(LASER_PIN, 127); 
+  
+  Serial.println("Sender 1 Active: ID1 at 1500 Hz");
+}
+
+void loop() {
+  // Handled by hardware timer
+}
