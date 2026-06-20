@@ -1,0 +1,614 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Adafruit_NeoPixel.h>
+#include <math.h>
+#include <string.h>
+
+// =========================================================
+// CONFIG
+// =========================================================
+// Red Tower: detects opponent (blue team) Li-Fi frequency.
+const bool BOT1 = true;
+
+const float FREQ_BOT1 = 1500.0f;
+const float FREQ_BOT2 = 2000.0f;
+
+const float SELF_FREQ  = BOT1 ? FREQ_BOT1 : FREQ_BOT2;
+const float ENEMY_FREQ = BOT1 ? FREQ_BOT2 : FREQ_BOT1;
+
+#define UNIT_ID "redTower"
+#define TEAM_ID "red"
+#define ROLE_ID "tower"
+
+// Update if your master MAC is different
+uint8_t MASTER_MAC[6] = {0x88, 0x57, 0x21, 0x2F, 0x1F, 0xF8};
+
+// =========================================================
+// PINS
+// =========================================================
+#define SOLAR1_PIN 34
+#define SOLAR2_PIN 35
+#define SOLAR3_PIN 32
+
+#define HEALTH_RING_PIN 26   // 16 LED health ring
+#define STRIP_DROP_PIN 14     // 56 LED strip #1: drop effect
+#define STRIP_HEALTH_PIN 18   // 56 LED strip #2: tower health animation
+
+#define HEALTH_RING_LEDS 16
+#define STRIP_LEDS 56
+
+// =========================================================
+// PACKETS
+// =========================================================
+typedef struct __attribute__((packed)) {
+  char unit_id[12];
+  char team[8];
+  char role[8];
+  char state[12];
+  uint16_t health;
+  uint16_t max_health;
+  bool laser_on;
+  char hit_from[12];
+  char hit_to[12];
+  uint16_t hit_damage;
+  uint16_t score_delta;
+  uint32_t packet_seq;
+} UnitTxPacket;
+
+typedef struct __attribute__((packed)) {
+  char command[16];       // MATCH_START / MATCH_STOP / MATCH_RESET / SET_SCORE / SET_TOWER / SET_UNIT / HIT / SET_TIME
+  uint32_t duration_sec;
+  char target_unit[12];
+  uint16_t value;
+  char state[12];
+} MasterCmdPacket;
+
+// =========================================================
+// HARDWARE
+// =========================================================
+Adafruit_NeoPixel ring(HEALTH_RING_LEDS, HEALTH_RING_PIN, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel dropStrip(STRIP_LEDS, STRIP_DROP_PIN, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel healthStrip(STRIP_LEDS, STRIP_HEALTH_PIN, NEO_GRB + NEO_KHZ800);
+
+// =========================================================
+// GAME STATE
+// =========================================================
+const int HEALTH_MAX = 16;
+int health = HEALTH_MAX;
+
+bool matchRunning = false;
+bool towerEnabled = false;       // controlled by master
+bool isDestroyed = false;
+bool isTargeted = false;
+bool flickerToggle = false;
+
+unsigned long lockOnStartTime = 0;
+unsigned long lastDamageTime = 0;
+unsigned long lastFlickerTime = 0;
+unsigned long lastAnimTime = 0;
+unsigned long lastStatusSend = 0;
+uint32_t packetSeq = 0;
+
+// =========================================================
+// TIMING
+// =========================================================
+const unsigned long REQUIRED_LOCK_TIME = 400;   // ms
+const unsigned long DAMAGE_TICK_RATE   = 1000;   // ms between 1 HP loss
+const unsigned long FLICKER_SPEED      = 35;     // ms
+const unsigned long STATUS_PERIOD_MS   = 500;    // periodic status to master
+
+// =========================================================
+// SAMPLING / FREQUENCY DETECTION
+// =========================================================
+#define SAMPLE_FREQ 6000.0f
+#define SAMPLES 120
+
+const int SENSOR_COUNT = 3;
+const int sensorPins[SENSOR_COUNT] = { SOLAR1_PIN, SOLAR2_PIN, SOLAR3_PIN };
+
+const float DETECT_FREQS[2] = { SELF_FREQ, ENEMY_FREQ };
+float coeff[2];
+
+const float ENEMY_THRESHOLD = 300000.0f;  // tune on your hardware
+
+float s_prev[2][SENSOR_COUNT];
+float s_prev2[2][SENSOR_COUNT];
+
+// =========================================================
+// HELPERS
+// =========================================================
+void copySafe(char* dest, size_t size, const char* src) {
+  memset(dest, 0, size);
+  if (src && size > 0) {
+    strncpy(dest, src, size - 1);
+  }
+}
+
+void showRingHealth() {
+  ring.clear();
+
+  if (health <= 0) {
+    if (flickerToggle) {
+      for (int i = 0; i < HEALTH_RING_LEDS; i++) {
+        ring.setPixelColor(i, ring.Color(255, 0, 0));
+      }
+    }
+    ring.show();
+    return;
+  }
+
+  int ledsToLight = health;
+  if (ledsToLight > HEALTH_RING_LEDS) ledsToLight = HEALTH_RING_LEDS;
+
+  uint32_t color;
+  if (health >= 11)      color = ring.Color(0, 255, 0);
+  else if (health >= 6)  color = ring.Color(255, 180, 0);
+  else                   color = ring.Color(255, 0, 0);
+
+  for (int i = 0; i < ledsToLight; i++) {
+    ring.setPixelColor(i, color);
+  }
+
+  ring.show();
+}
+
+void setAllPixels(Adafruit_NeoPixel& strip, uint32_t c) {
+  for (int i = 0; i < (int)strip.numPixels(); i++) {
+    strip.setPixelColor(i, c);
+  }
+  strip.show();
+}
+
+const char* currentStateString() {
+  if (!matchRunning) return "inactive";
+  if (isDestroyed) return "destroyed";
+  return towerEnabled ? "enabled" : "disabled";
+}
+
+void sendTxPacket(const char* hitFrom = "", const char* hitTo = "", uint16_t hitDamage = 0) {
+  UnitTxPacket pkt;
+  memset(&pkt, 0, sizeof(pkt));
+
+  strncpy(pkt.unit_id, UNIT_ID, sizeof(pkt.unit_id) - 1);
+  strncpy(pkt.team, TEAM_ID, sizeof(pkt.team) - 1);
+  strncpy(pkt.role, ROLE_ID, sizeof(pkt.role) - 1);
+  strncpy(pkt.state, currentStateString(), sizeof(pkt.state) - 1);
+
+  pkt.health = (uint16_t)health;
+  pkt.max_health = (uint16_t)HEALTH_MAX;
+  pkt.laser_on = false;
+
+  if (hitFrom && hitFrom[0]) strncpy(pkt.hit_from, hitFrom, sizeof(pkt.hit_from) - 1);
+  if (hitTo && hitTo[0]) strncpy(pkt.hit_to, hitTo, sizeof(pkt.hit_to) - 1);
+
+  pkt.hit_damage = hitDamage;
+  pkt.score_delta = 0;
+  pkt.packet_seq = ++packetSeq;
+
+  esp_now_send(MASTER_MAC, (uint8_t*)&pkt, sizeof(pkt));
+  lastStatusSend = millis();
+}
+
+void updateVisuals() {
+  showRingHealth();
+}
+
+void resetTargetState() {
+  isTargeted = false;
+  lockOnStartTime = 0;
+  lastDamageTime = 0;
+}
+
+void setHealth(int newHealth, bool reportToMaster = true) {
+  if (newHealth < 0) newHealth = 0;
+  if (newHealth > HEALTH_MAX) newHealth = HEALTH_MAX;
+
+  health = newHealth;
+  isDestroyed = (health <= 0);
+
+  if (isDestroyed) {
+    resetTargetState();
+    flickerToggle = false;
+  }
+
+  updateVisuals();
+  if (reportToMaster) sendTxPacket();
+}
+
+void applyDamage(uint16_t damage, const char* hitFrom, bool reportHitToMaster) {
+  if (!towerEnabled) return;   // master says tower is protected
+  if (health <= 0) return;
+
+  if (damage == 0) damage = 1;
+  if (damage > (uint16_t)health) damage = (uint16_t)health;
+
+  health -= damage;
+
+  if (health <= 0) {
+    health = 0;
+    isDestroyed = true;
+    resetTargetState();
+    flickerToggle = false;
+  }
+
+  updateVisuals();
+
+  if (reportHitToMaster) {
+    sendTxPacket(hitFrom, UNIT_ID, damage);
+  } else {
+    sendTxPacket();
+  }
+}
+
+void computeGoertzelCoefficients() {
+  for (int f = 0; f < 2; f++) {
+    int k = (int)(0.5f + (SAMPLES * DETECT_FREQS[f]) / SAMPLE_FREQ);
+    float w = (2.0f * PI * k) / SAMPLES;
+    coeff[f] = 2.0f * cosf(w);
+  }
+}
+
+void sampleFrequencies(float &enemyMagAvg, float &selfMagAvg) {
+  memset(s_prev, 0, sizeof(s_prev));
+  memset(s_prev2, 0, sizeof(s_prev2));
+
+  const unsigned long sampling_period_us = (unsigned long)(1000000.0f / SAMPLE_FREQ);
+
+  for (int i = 0; i < SAMPLES; i++) {
+    unsigned long start_time = micros();
+
+    float adc[SENSOR_COUNT];
+    for (int s = 0; s < SENSOR_COUNT; s++) {
+      adc[s] = (float)analogRead(sensorPins[s]);
+    }
+
+    for (int f = 0; f < 2; f++) {
+      for (int s = 0; s < SENSOR_COUNT; s++) {
+        float val = adc[s] + coeff[f] * s_prev[f][s] - s_prev2[f][s];
+        s_prev2[f][s] = s_prev[f][s];
+        s_prev[f][s] = val;
+      }
+    }
+
+    while ((micros() - start_time) < sampling_period_us) {
+      // timing hold
+    }
+  }
+
+  selfMagAvg = 0.0f;
+  enemyMagAvg = 0.0f;
+
+  for (int s = 0; s < SENSOR_COUNT; s++) {
+    float selfMag =
+      s_prev2[0][s] * s_prev2[0][s] +
+      s_prev[0][s]  * s_prev[0][s]  -
+      coeff[0] * s_prev[0][s] * s_prev2[0][s];
+
+    float enemyMag =
+      s_prev2[1][s] * s_prev2[1][s] +
+      s_prev[1][s]  * s_prev[1][s]  -
+      coeff[1] * s_prev[1][s] * s_prev2[1][s];
+
+    selfMagAvg += selfMag;
+    enemyMagAvg += enemyMag;
+  }
+
+  selfMagAvg /= SENSOR_COUNT;
+  enemyMagAvg /= SENSOR_COUNT;
+}
+
+// =========================================================
+// MASTER COMMAND HANDLING
+// =========================================================
+void handleMasterCommand(const MasterCmdPacket& cmd) {
+  if (strcmp(cmd.command, "MATCH_START") == 0) {
+    matchRunning = true;
+    resetTargetState();
+    sendTxPacket();
+    return;
+  }
+
+  if (strcmp(cmd.command, "MATCH_STOP") == 0) {
+    matchRunning = false;
+    towerEnabled = false;
+    resetTargetState();
+    sendTxPacket();
+    return;
+  }
+
+  if (strcmp(cmd.command, "MATCH_RESET") == 0) {
+    matchRunning = false;
+    towerEnabled = false;
+    setHealth(HEALTH_MAX, false);
+    resetTargetState();
+    sendTxPacket();
+    return;
+  }
+
+  if (strcmp(cmd.command, "SET_TIME") == 0) {
+    return;
+  }
+
+  // Master enables/disables this tower using SET_UNIT target_unit = "redTower"
+  if (strcmp(cmd.command, "SET_UNIT") == 0) {
+    if (strcmp(cmd.target_unit, UNIT_ID) == 0) {
+      if (strcmp(cmd.state, "enabled") == 0) {
+        towerEnabled = true;
+      } else if (strcmp(cmd.state, "disabled") == 0) {
+        towerEnabled = false;
+      }
+
+      Serial.print("TowerEnabled=");
+      Serial.println(towerEnabled ? "1" : "0");
+      sendTxPacket();
+    }
+    return;
+  }
+
+  // Master can directly set health if needed
+  if (strcmp(cmd.command, "SET_TOWER") == 0) {
+    if (strcmp(cmd.target_unit, UNIT_ID) == 0) {
+      setHealth((int)cmd.value, false);
+      sendTxPacket();
+    }
+    return;
+  }
+
+  if (strcmp(cmd.command, "HIT") == 0) {
+    if (strcmp(cmd.target_unit, UNIT_ID) == 0) {
+      const char* fromUnit = (strlen(cmd.state) > 0) ? cmd.state : "blueTeam";
+      applyDamage(cmd.value > 0 ? cmd.value : 1, fromUnit, false);
+    }
+    return;
+  }
+}
+
+void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len == (int)sizeof(MasterCmdPacket)) {
+    MasterCmdPacket cmd;
+    memcpy(&cmd, data, sizeof(cmd));
+    cmd.command[sizeof(cmd.command) - 1] = '\0';
+    cmd.target_unit[sizeof(cmd.target_unit) - 1] = '\0';
+    cmd.state[sizeof(cmd.state) - 1] = '\0';
+    handleMasterCommand(cmd);
+  }
+}
+
+void setupEspNow() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    return;
+  }
+
+  esp_now_register_recv_cb(onEspNowRecv);
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, MASTER_MAC, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_STA;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add master peer");
+  }
+}
+
+// =========================================================
+// EFFECTS
+// =========================================================
+void breathingEffect() {
+  static uint8_t level = 0;
+  static bool up = true;
+
+  if (millis() - lastAnimTime < 25) return;
+  lastAnimTime = millis();
+
+  if (up) {
+    if (level < 140) level += 2;
+    else up = false;
+  } else {
+    if (level > 4) level -= 2;
+    else up = true;
+  }
+
+  uint32_t c = dropStrip.Color(level, 0, 0);
+  setAllPixels(dropStrip, c);
+  setAllPixels(healthStrip, c);
+}
+
+void dropEffect() {
+  static int headPos = -8;
+  static int tailLen = 8;
+
+  if (millis() - lastAnimTime < 35) return;
+  lastAnimTime = millis();
+
+  dropStrip.clear();
+
+  for (int t = 0; t < tailLen; t++) {
+    int p = headPos - t;
+    if (p >= 0 && p < STRIP_LEDS) {
+      uint8_t b = 255 - (t * 25);
+      if (b > 255) b = 0;
+      dropStrip.setPixelColor(p, dropStrip.Color(b, 0, 0));
+    }
+  }
+
+  dropStrip.show();
+
+  headPos++;
+  if (headPos >= STRIP_LEDS + tailLen) {
+    headPos = -tailLen;
+  }
+}
+
+void showTowerHealthStrip() {
+  healthStrip.clear();
+
+  if (health <= 0) {
+    healthStrip.show();
+    return;
+  }
+
+  int leds = map(health, 0, HEALTH_MAX, 0, STRIP_LEDS);
+  if (leds < 0) leds = 0;
+  if (leds > STRIP_LEDS) leds = STRIP_LEDS;
+
+  uint32_t baseColor;
+  if (health > 10)      baseColor = healthStrip.Color(0, 255, 0);
+  else if (health > 5)  baseColor = healthStrip.Color(255, 140, 0);
+  else                  baseColor = healthStrip.Color(255, 0, 0);
+
+  for (int i = 0; i < leds; i++) {
+    healthStrip.setPixelColor(i, baseColor);
+  }
+
+  if (leds > 0) {
+    int pulsePos = (millis() / 80) % leds;
+    healthStrip.setPixelColor(pulsePos, healthStrip.Color(255, 255, 255));
+  }
+
+  healthStrip.show();
+}
+
+void updateTowerEffects() {
+  if (!towerEnabled) {
+    breathingEffect();
+  } else {
+    dropEffect();
+    showTowerHealthStrip();
+  }
+}
+
+// =========================================================
+// SETUP / LOOP
+// =========================================================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  pinMode(SOLAR1_PIN, INPUT);
+  pinMode(SOLAR2_PIN, INPUT);
+  pinMode(SOLAR3_PIN, INPUT);
+  analogSetAttenuation(ADC_11db);
+
+  ring.begin();
+  ring.setBrightness(40);
+  ring.show();
+
+  dropStrip.begin();
+  dropStrip.setBrightness(50);
+  dropStrip.show();
+
+  healthStrip.begin();
+  healthStrip.setBrightness(50);
+  healthStrip.show();
+
+  computeGoertzelCoefficients();
+  updateVisuals();
+
+  setupEspNow();
+
+  Serial.println();
+  Serial.println("RED TOWER READY");
+  Serial.print("UNIT_ID = ");
+  Serial.println(UNIT_ID);
+  Serial.print("SELF_FREQ = ");
+  Serial.println(SELF_FREQ);
+  Serial.print("ENEMY_FREQ = ");
+  Serial.println(ENEMY_FREQ);
+  Serial.println("Solar pins: 34, 35, 26");
+  Serial.println("Health ring pin: 32");
+  Serial.println("Drop strip pin: 2");
+  Serial.println("Health strip pin: 4");
+
+  sendTxPacket();
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  if (now - lastStatusSend >= STATUS_PERIOD_MS) {
+    sendTxPacket();
+  }
+
+  if (!matchRunning) {
+    updateTowerEffects();
+    delay(10);
+    return;
+  }
+
+  if (isDestroyed) {
+    if (now - lastFlickerTime >= 250) {
+      lastFlickerTime = now;
+      flickerToggle = !flickerToggle;
+      showRingHealth();
+    }
+    updateTowerEffects();
+    delay(5);
+    return;
+  }
+
+  updateTowerEffects();
+  showRingHealth();
+
+  if (!towerEnabled) {
+    delay(5);
+    return;
+  }
+
+  float selfMagAvg = 0.0f;
+  float enemyMagAvg = 0.0f;
+
+  sampleFrequencies(enemyMagAvg, selfMagAvg);
+
+  bool enemyDetected = (enemyMagAvg > ENEMY_THRESHOLD) &&
+                       (enemyMagAvg > (selfMagAvg * 1.8f));
+
+  if (enemyDetected) {
+    if (!isTargeted) {
+      isTargeted = true;
+      lockOnStartTime = now;
+      lastFlickerTime = now;
+      flickerToggle = true;
+    }
+
+    if (now - lastFlickerTime >= FLICKER_SPEED) {
+      lastFlickerTime = now;
+      flickerToggle = !flickerToggle;
+      showRingHealth();
+    }
+
+    if ((now - lockOnStartTime) >= REQUIRED_LOCK_TIME) {
+      if ((now - lastDamageTime) >= DAMAGE_TICK_RATE) {
+        applyDamage(1, "blueTeam", true);
+        lastDamageTime = now;
+      }
+    }
+  } else {
+    if (isTargeted) {
+      resetTargetState();
+      updateVisuals();
+    }
+  }
+
+  static unsigned long lastPrint = 0;
+  if (now - lastPrint >= 300) {
+    lastPrint = now;
+    Serial.print("Self=");
+    Serial.print(selfMagAvg, 0);
+    Serial.print(" Enemy=");
+    Serial.print(enemyMagAvg, 0);
+    Serial.print(" Det=");
+    Serial.print(enemyDetected ? "1" : "0");
+    Serial.print(" HP=");
+    Serial.print(health);
+    Serial.print(" Tower=");
+    Serial.println(towerEnabled ? "ENABLED" : "DISABLED");
+  }
+
+  delay(5);
+}
